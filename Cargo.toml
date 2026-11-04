@@ -1,0 +1,35 @@
+[package]
+name = "dcl-facilitator"
+version = "0.0.1"
+edition = "2021"
+publish = false
+description = "x402 facilitator with a DCL policy gate (Leibniz layer)"
+
+# Dependencies are added milestone by milestone, so that every version is
+# chosen and checked at the moment it is first needed:
+#   M3 settle : a transaction builder, still not added. Verify only recovers
+#               EIP-712 signatures and sends eth_call, so it uses k256, sha3,
+#               and reqwest rather than alloy.
+#   M2 store / state      : sqlx with the sqlite feature (added)
+#   M5 Leibniz gate       : sha2 (journal hash chain)
+
+[dependencies]
+axum = { version = "0.7", default-features = false, features = ["http1", "json", "tokio"] }
+k256 = { version = "0.13", default-features = false, features = ["ecdsa"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "native-tls"] }
+serde_json = "1"
+sha3 = "0.10"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite"] }
+thiserror = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+http-body-util = "0.1"
+tokio = { version = "1", features = ["test-util"] }
+tower = { version = "0.5", features = ["util"] }
+
+[profile.release]
+lto = "thin"
+strip = true

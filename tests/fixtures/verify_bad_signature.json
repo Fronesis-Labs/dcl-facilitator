@@ -1,0 +1,35 @@
+{
+  "x402Version": 2,
+  "paymentPayload": {
+    "x402Version": 2,
+    "accepted": {
+      "scheme": "exact",
+      "network": "eip155:8453",
+      "amount": "10000",
+      "asset": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+      "payTo": "0x0000000000000000000000000000000000000001",
+      "maxTimeoutSeconds": 4102444800,
+      "extra": { "name": "USD Coin", "version": "2" }
+    },
+    "payload": {
+      "signature": "0x1111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111",
+      "authorization": {
+        "from": "0x0000000000000000000000000000000000000002",
+        "to": "0x0000000000000000000000000000000000000001",
+        "value": "10000",
+        "validAfter": "0",
+        "validBefore": "4102444800",
+        "nonce": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      }
+    }
+  },
+  "paymentRequirements": {
+    "scheme": "exact",
+    "network": "eip155:8453",
+    "amount": "10000",
+    "asset": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+    "payTo": "0x0000000000000000000000000000000000000001",
+    "maxTimeoutSeconds": 4102444800,
+    "extra": { "name": "USD Coin", "version": "2" }
+  }
+}
