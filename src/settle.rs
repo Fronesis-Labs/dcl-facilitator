@@ -30,8 +30,8 @@ use crate::evidence::{
 use crate::leibniz::{ActionDigest, Commit, Decision, NoCommit, PaymentContext};
 use crate::machine::PaymentState;
 use crate::store::{
-    PutOutcome, ReceiptObservation, SettlementEvidence, SignedSettlement, Store, StoreError,
-    StoredCommit, StoredDecision,
+    PutOutcome, ReceiptObservation, SettlementEvidence, SignedCommit, SignedSettlement, Store,
+    StoreError, StoredCommit, StoredDecision,
 };
 use crate::verify::{self, Checked, MIN_VALID_BEFORE_LEAD};
 
@@ -51,7 +51,10 @@ pub struct SettleEnv<'a> {
     pub stop: Option<&'a AtomicBool>,
 }
 
-#[derive(Clone, Copy)]
+/// Test seam that stops settlement after a durable point. The variants exist
+/// only in the test build, where the suite constructs each one.
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum StopAfter {
     Commit,
     Broadcast,
@@ -59,20 +62,77 @@ enum StopAfter {
     Confirmed,
 }
 
+#[cfg(test)]
+type Halt = Option<StopAfter>;
+
+#[cfg(not(test))]
+#[derive(Clone, Copy)]
+struct Halt;
+
+#[cfg(test)]
+fn halt_none() -> Halt {
+    None
+}
+
+#[cfg(not(test))]
+fn halt_none() -> Halt {
+    Halt
+}
+
+#[cfg(test)]
+fn halted(stop: Halt, point: StopAfter) -> bool {
+    matches!(stop, Some(found) if found == point)
+}
+
+#[cfg(not(test))]
+fn halted(stop: Halt) -> bool {
+    match stop {
+        Halt => false,
+    }
+}
+
+fn halted_commit(stop: Halt) -> bool {
+    #[cfg(test)]
+    {
+        halted(stop, StopAfter::Commit)
+    }
+    #[cfg(not(test))]
+    {
+        halted(stop)
+    }
+}
+
+fn halted_broadcast(stop: Halt) -> bool {
+    #[cfg(test)]
+    {
+        halted(stop, StopAfter::Broadcast)
+    }
+    #[cfg(not(test))]
+    {
+        halted(stop)
+    }
+}
+
+fn halted_confirmed(stop: Halt) -> bool {
+    #[cfg(test)]
+    {
+        halted(stop, StopAfter::Confirmed)
+    }
+    #[cfg(not(test))]
+    {
+        halted(stop)
+    }
+}
+
 pub async fn settle_body(body: &Value, now: u64, env: &SettleEnv<'_>) -> Value {
-    drive(body, now, env, None).await
+    drive(body, now, env, halt_none()).await
 }
 
 pub fn rejected(reason: &str) -> Value {
     failure(reason, None, None)
 }
 
-async fn drive(
-    body: &Value,
-    now: u64,
-    env: &SettleEnv<'_>,
-    stop: Option<StopAfter>,
-) -> Value {
+async fn drive(body: &Value, now: u64, env: &SettleEnv<'_>, stop: Halt) -> Value {
     let (checked, blocked) = match verify::accept_local(body, now) {
         Ok(checked) => (checked, None),
         Err((reason, payer)) => match verify::accept_replay(body) {
@@ -92,7 +152,11 @@ async fn drive(
     // Fixed before the same-payment lock. Time spent waiting is part of this
     // instant, so a wait cannot extend past `validBefore` minus the lead or
     // past the configured receipt timeout.
-    let deadline = settle_deadline(now, &checked.authorization.valid_before, env.receipt_timeout);
+    let deadline = settle_deadline(
+        now,
+        &checked.authorization.valid_before,
+        env.receipt_timeout,
+    );
     let _payment = env.store.lock_payment(&context).await;
     match existing_payment(env, &checked, &context, &action, now, deadline).await {
         Ok(Some(response)) => return response,
@@ -228,15 +292,32 @@ async fn drive(
         }
         PaymentState::Rejected => return failure(UNEXPECTED_SETTLE, Some(&payer), None),
         PaymentState::Settling | PaymentState::SettlementUnknown => {
-            return resume(env, &checked, &context, &action, payment.state(), now, deadline)
-                .await;
+            return resume(
+                env,
+                &checked,
+                &context,
+                &action,
+                payment.state(),
+                now,
+                deadline,
+            )
+            .await;
         }
         PaymentState::Committed => {}
         _ => return failure(UNEXPECTED_SETTLE, Some(&payer), None),
     }
     match env.store.evidence(&context).await {
         Ok(Some(_)) => {
-            return resume(env, &checked, &context, &action, payment.state(), now, deadline).await
+            return resume(
+                env,
+                &checked,
+                &context,
+                &action,
+                payment.state(),
+                now,
+                deadline,
+            )
+            .await
         }
         Ok(None) => {}
         Err(_) => return failure(UNEXPECTED_SETTLE, Some(&payer), None),
@@ -257,12 +338,14 @@ async fn drive(
     }
     sign_verified_commit(
         env,
-        &checked,
-        &context,
-        &action,
-        &commit,
-        &record,
-        &decision,
+        Admitted {
+            checked: &checked,
+            context: &context,
+            action: &action,
+            commit: &commit,
+            record: &record,
+            decision: &decision,
+        },
         calldata,
         plan,
         deadline,
@@ -298,11 +381,7 @@ async fn existing_payment(
         }
         PaymentState::SettleFailed => {
             let hash = evidence_hash(env.store, context).await;
-            Ok(Some(failure(
-                UNEXPECTED_SETTLE,
-                Some(&checked.payer),
-                hash,
-            )))
+            Ok(Some(failure(UNEXPECTED_SETTLE, Some(&checked.payer), hash)))
         }
         PaymentState::Rejected => Ok(Some(failure(UNEXPECTED_SETTLE, Some(&checked.payer), None))),
         PaymentState::Settling | PaymentState::SettlementUnknown => {
@@ -314,7 +393,16 @@ async fn existing_payment(
                 )));
             }
             Ok(Some(
-                resume(env, checked, context, action, payment.state(), now, deadline).await,
+                resume(
+                    env,
+                    checked,
+                    context,
+                    action,
+                    payment.state(),
+                    now,
+                    deadline,
+                )
+                .await,
             ))
         }
         PaymentState::Received | PaymentState::Verified | PaymentState::Committed => Ok(None),
@@ -412,16 +500,13 @@ async fn stored_oracle_binds_raw(
     if signer != stored.authorization.from {
         return false;
     }
-    match env.store.evidence(context).await {
+    matches!(
+        env.store.evidence(context).await,
         Ok(Some(evidence))
             if evidence.raw_tx == raw
                 && evidence.tx_hash == hash
-                && evidence.calldata == calldata =>
-        {
-            true
-        }
-        _ => false,
-    }
+                && evidence.calldata == calldata
+    )
 }
 
 fn expected_binding(
@@ -433,7 +518,7 @@ fn expected_binding(
         .map_err(|_| ())
 }
 
-fn authorization_identity(checked: &Checked) -> AuthorizationIdentity {
+pub(crate) fn authorization_identity(checked: &Checked) -> AuthorizationIdentity {
     let auth = &checked.authorization;
     AuthorizationIdentity::new(
         BASE_CHAIN_ID,
@@ -458,7 +543,9 @@ async fn resume_evidence(
 ) -> Value {
     let hash = evidence.tx_hash;
     if !stored_oracle_binds_raw(env, context, &evidence.raw_tx, hash).await {
-        tracing::warn!("refusing to resume a settlement whose stored oracle evidence does not bind");
+        tracing::warn!(
+            "refusing to resume a settlement whose stored oracle evidence does not bind"
+        );
         return failure(UNEXPECTED_SETTLE, Some(&checked.payer), Some(hash));
     }
     if transaction_hash(&evidence.raw_tx) != hash {
@@ -467,7 +554,7 @@ async fn resume_evidence(
     }
     match env.rpc.receipt(hash).await {
         Ok(Some(_)) => {
-            return finish_hash(env, checked, context, action, hash, deadline, None).await
+            return finish_hash(env, checked, context, action, hash, deadline, halt_none()).await
         }
         Ok(None) => {}
         Err(_) => {
@@ -486,7 +573,10 @@ async fn resume_evidence(
                 remember_unknown(env, context, action, PaymentState::Settling).await;
                 return failure(UNEXPECTED_SETTLE, Some(&checked.payer), Some(hash));
             }
-            if broadcast_stored(env, context, &evidence.raw_tx, hash).await.is_err() {
+            if broadcast_stored(env, context, &evidence.raw_tx, hash)
+                .await
+                .is_err()
+            {
                 remember_unknown(env, context, action, PaymentState::Settling).await;
                 return failure(UNEXPECTED_SETTLE, Some(&checked.payer), Some(hash));
             }
@@ -496,7 +586,7 @@ async fn resume_evidence(
             return failure(UNEXPECTED_SETTLE, Some(&checked.payer), Some(hash));
         }
     }
-    finish_hash(env, checked, context, action, hash, deadline, None).await
+    finish_hash(env, checked, context, action, hash, deadline, halt_none()).await
 }
 
 async fn finish_hash(
@@ -506,7 +596,7 @@ async fn finish_hash(
     action: &ActionDigest,
     hash: [u8; 32],
     deadline: Instant,
-    stop: Option<StopAfter>,
+    stop: Halt,
 ) -> Value {
     let verdict = match judge(env, checked, context, hash, deadline).await {
         Ok(verdict) => verdict,
@@ -515,7 +605,7 @@ async fn finish_hash(
             return failure(UNEXPECTED_SETTLE, Some(&checked.payer), Some(hash));
         }
     };
-    if matches!(stop, Some(StopAfter::Confirmed)) {
+    if halted_confirmed(stop) {
         if let Verdict::Confirmed(_) = verdict {
             return failure(UNEXPECTED_SETTLE, Some(&checked.payer), Some(hash));
         }
@@ -571,7 +661,12 @@ async fn judge(
     if env.rpc.chain_id().await.map_err(|_| ())? != BASE_CHAIN_ID {
         return Ok(Verdict::Inconclusive);
     }
-    let evidence = env.store.evidence(context).await.map_err(|_| ())?.ok_or(())?;
+    let evidence = env
+        .store
+        .evidence(context)
+        .await
+        .map_err(|_| ())?
+        .ok_or(())?;
     if evidence.tx_hash != hash || transaction_hash(&evidence.raw_tx) != hash {
         return Ok(Verdict::Inconclusive);
     }
@@ -593,7 +688,13 @@ async fn judge(
         Ok(block) => block.hash == receipt.block_hash,
         Err(_) => false,
     };
-    if !identity_matches(&transaction, &receipt, &evidence, env.relayer.address(), hash) || !canonical
+    if !identity_matches(
+        &transaction,
+        &receipt,
+        &evidence,
+        env.relayer.address(),
+        hash,
+    ) || !canonical
     {
         return Ok(Verdict::Inconclusive);
     }
@@ -758,7 +859,11 @@ async fn recover_payment(env: &SettleEnv<'_>, context: &PaymentContext, now: u64
         tracing::warn!("stored authorization does not match the payment action");
         return Attempt::Inconclusive;
     }
-    let deadline = settle_deadline(now, &checked.authorization.valid_before, env.receipt_timeout);
+    let deadline = settle_deadline(
+        now,
+        &checked.authorization.valid_before,
+        env.receipt_timeout,
+    );
     let _ = resume(
         env,
         &checked,
@@ -774,7 +879,12 @@ async fn recover_payment(env: &SettleEnv<'_>, context: &PaymentContext, now: u64
         .get(context.network(), context.payer(), context.nonce())
         .await
     {
-        Ok(payment) if matches!(payment.state(), PaymentState::Settled | PaymentState::SettleFailed) => {
+        Ok(payment)
+            if matches!(
+                payment.state(),
+                PaymentState::Settled | PaymentState::SettleFailed
+            ) =>
+        {
             Attempt::Terminal
         }
         _ => Attempt::Inconclusive,
@@ -812,7 +922,11 @@ async fn recover_signature(env: &SettleEnv<'_>, context: &PaymentContext, now: u
     if env.rpc.chain_id().await.ok() != Some(BASE_CHAIN_ID) {
         return Attempt::Inconclusive;
     }
-    let deadline = settle_deadline(now, &checked.authorization.valid_before, env.receipt_timeout);
+    let deadline = settle_deadline(
+        now,
+        &checked.authorization.valid_before,
+        env.receipt_timeout,
+    );
     if !deadline_open(deadline) {
         return Attempt::Inconclusive;
     }
@@ -827,16 +941,18 @@ async fn recover_signature(env: &SettleEnv<'_>, context: &PaymentContext, now: u
     };
     let _ = sign_verified_commit(
         env,
-        &checked,
-        context,
-        &action,
-        &commit,
-        &record,
-        &decision,
+        Admitted {
+            checked: &checked,
+            context,
+            action: &action,
+            commit: &commit,
+            record: &record,
+            decision: &decision,
+        },
         calldata,
         plan,
         deadline,
-        None,
+        halt_none(),
     )
     .await;
     match env
@@ -844,7 +960,12 @@ async fn recover_signature(env: &SettleEnv<'_>, context: &PaymentContext, now: u
         .get(context.network(), context.payer(), context.nonce())
         .await
     {
-        Ok(payment) if matches!(payment.state(), PaymentState::Settled | PaymentState::SettleFailed) => {
+        Ok(payment)
+            if matches!(
+                payment.state(),
+                PaymentState::Settled | PaymentState::SettleFailed
+            ) =>
+        {
             Attempt::Terminal
         }
         _ => Attempt::Inconclusive,
@@ -857,7 +978,11 @@ async fn admit_verified_commit(
     checked: &Checked,
     context: &PaymentContext,
     action: &ActionDigest,
-) -> Option<(Commit, crate::evidence::ConsumptionRecord, crate::evidence::DclDecisionEvidence)> {
+) -> Option<(
+    Commit,
+    crate::evidence::ConsumptionRecord,
+    crate::evidence::DclDecisionEvidence,
+)> {
     let StoredCommit::Verified(stored) = env.store.stored_commit(context).await.ok()? else {
         return None;
     };
@@ -904,19 +1029,31 @@ fn payer_signature_binds(checked: &Checked) -> bool {
         .is_some_and(|signer| signer == checked.authorization.from)
 }
 
+struct Admitted<'a> {
+    checked: &'a Checked,
+    context: &'a PaymentContext,
+    action: &'a ActionDigest,
+    commit: &'a Commit,
+    record: &'a crate::evidence::ConsumptionRecord,
+    decision: &'a crate::evidence::DclDecisionEvidence,
+}
+
 async fn sign_verified_commit(
     env: &SettleEnv<'_>,
-    checked: &Checked,
-    context: &PaymentContext,
-    action: &ActionDigest,
-    commit: &Commit,
-    record: &crate::evidence::ConsumptionRecord,
-    decision: &crate::evidence::DclDecisionEvidence,
+    admitted: Admitted<'_>,
     calldata: Vec<u8>,
     plan: GasPlan,
     deadline: Instant,
-    stop: Option<StopAfter>,
+    stop: Halt,
 ) -> Value {
+    let Admitted {
+        checked,
+        context,
+        action,
+        commit,
+        record,
+        decision,
+    } = admitted;
     let payer = checked.payer.clone();
     let claim = match env.store.claim_signing(context).await {
         Ok(claim) => claim,
@@ -984,7 +1121,15 @@ async fn sign_verified_commit(
         };
         if env
             .store
-            .commit_signed(context, action, commit, &draft, record, decision, &claim)
+            .commit_signed(SignedCommit {
+                context,
+                action,
+                commit,
+                signed: &draft,
+                record,
+                evidence: decision,
+                claim: &claim,
+            })
             .await
             .is_err()
         {
@@ -1004,14 +1149,14 @@ async fn sign_verified_commit(
             return failure(UNEXPECTED_SETTLE, Some(&payer), Some(signed.hash));
         }
     };
-    if matches!(stop, Some(StopAfter::Commit)) {
+    if halted_commit(stop) {
         return failure(UNEXPECTED_SETTLE, Some(&payer), Some(persisted.tx_hash));
     }
     if let Err(()) = broadcast_stored(env, context, &persisted.raw_tx, persisted.tx_hash).await {
         let _ = env.store.mark_unknown(context, action).await;
         return failure(UNEXPECTED_SETTLE, Some(&payer), Some(persisted.tx_hash));
     }
-    if matches!(stop, Some(StopAfter::Broadcast)) {
+    if halted_broadcast(stop) {
         return failure(UNEXPECTED_SETTLE, Some(&payer), Some(persisted.tx_hash));
     }
     finish_hash(
@@ -1026,7 +1171,10 @@ async fn sign_verified_commit(
     .await
 }
 
-async fn stored_checked(env: &SettleEnv<'_>, context: &PaymentContext) -> Option<crate::verify::Checked> {
+async fn stored_checked(
+    env: &SettleEnv<'_>,
+    context: &PaymentContext,
+) -> Option<crate::verify::Checked> {
     let stored = env.store.stored_authorization(context).await.ok()??;
     let from = address_bytes(&stored.payer)?;
     let to = address_bytes(&stored.pay_to)?;
@@ -1046,15 +1194,17 @@ async fn stored_checked(env: &SettleEnv<'_>, context: &PaymentContext) -> Option
 }
 
 fn address_bytes(value: &str) -> Option<[u8; 20]> {
-    fixed_hex(value, 20).map(|bytes| bytes.try_into().ok()).flatten()
+    fixed_hex(value, 20).and_then(|bytes| bytes.try_into().ok())
 }
 
 fn word_bytes(value: &str) -> Option<[u8; 32]> {
-    fixed_hex(value, 32).map(|bytes| bytes.try_into().ok()).flatten()
+    fixed_hex(value, 32).and_then(|bytes| bytes.try_into().ok())
 }
 
 fn fixed_hex(value: &str, width: usize) -> Option<Vec<u8>> {
-    let hex = value.strip_prefix("0x").or_else(|| value.strip_prefix("0X"))?;
+    let hex = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))?;
     if hex.len() != width * 2 {
         return None;
     }
@@ -1188,7 +1338,10 @@ async fn preflight(env: &SettleEnv<'_>, calldata: &[u8]) -> Result<GasPlan, ()> 
     let block = env.rpc.block("latest").await.map_err(|_| ())?;
     let base = block.base_fee.ok_or(())?;
     let tip = env.rpc.max_priority_fee().await.map_err(|_| ())?;
-    let max_fee = base.checked_mul(2).and_then(|fee| fee.checked_add(tip)).ok_or(())?;
+    let max_fee = base
+        .checked_mul(2)
+        .and_then(|fee| fee.checked_add(tip))
+        .ok_or(())?;
     if max_fee > env.max_fee_per_gas || tip > max_fee {
         return Err(());
     }
@@ -1217,7 +1370,13 @@ async fn preflight(env: &SettleEnv<'_>, calldata: &[u8]) -> Result<GasPlan, ()> 
     })
 }
 
-fn signed_matches(signed: &SignedTx, calldata: &[u8], nonce: u64, plan: GasPlan, env: &SettleEnv<'_>) -> bool {
+fn signed_matches(
+    signed: &SignedTx,
+    calldata: &[u8],
+    nonce: u64,
+    plan: GasPlan,
+    env: &SettleEnv<'_>,
+) -> bool {
     if transaction_hash(&signed.raw) != signed.hash {
         return false;
     }
@@ -1238,7 +1397,7 @@ fn signed_matches(signed: &SignedTx, calldata: &[u8], nonce: u64, plan: GasPlan,
         && sender == env.relayer.address()
 }
 
-fn settlement_action(checked: &Checked) -> ActionDigest {
+pub(crate) fn settlement_action(checked: &Checked) -> ActionDigest {
     let auth = &checked.authorization;
     let mut bytes = Vec::with_capacity(20 + 20 + 20 + 32 * 4 + 65);
     bytes.extend_from_slice(NETWORK.as_bytes());
@@ -1253,7 +1412,7 @@ fn settlement_action(checked: &Checked) -> ActionDigest {
     ActionDigest::new(keccak(&bytes))
 }
 
-fn payment_context(checked: &Checked) -> Result<PaymentContext, ()> {
+pub(crate) fn payment_context(checked: &Checked) -> Result<PaymentContext, ()> {
     PaymentContext::try_new(
         NETWORK,
         &checked.payer,
@@ -1318,10 +1477,8 @@ fn hex_encode(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chain::{signing_digest, test_address, test_sign, EIP712_NAME, EIP712_VERSION};
     use crate::store::StoredCommit;
-    use crate::chain::{
-        signing_digest, test_address, test_sign, EIP712_NAME, EIP712_VERSION,
-    };
     use crate::verify::INVALID_SIGNATURE;
     use axum::routing::post;
     use axum::{Json, Router};
@@ -1336,8 +1493,8 @@ mod tests {
     /// The production default is unchanged.
     const TEST_RECEIPT_TIMEOUT: Duration = Duration::from_secs(20);
 
-#[derive(Clone, Copy, Debug)]
-enum Outcome {
+    #[derive(Clone, Copy, Debug)]
+    enum Outcome {
         Success,
         Revert,
         BadTransfer,
@@ -1497,7 +1654,11 @@ enum Outcome {
     #[tokio::test]
     async fn raw_transaction_hash_mismatch_is_not_broadcast() {
         let (mut world, body) = committed_unsent([0x74; 32]).await;
-        world.store.overwrite_raw_tx_hash(&[0x9a; 32]).await.unwrap();
+        world
+            .store
+            .overwrite_raw_tx_hash(&[0x9a; 32])
+            .await
+            .unwrap();
         assert_retry_does_not_send(&mut world, &body).await;
     }
 
@@ -1557,7 +1718,11 @@ enum Outcome {
         assert!(world.sent.lock().unwrap().is_empty());
         let payment = loaded(&world, &refusal).await;
         assert_eq!(payment.state(), PaymentState::Rejected);
-        let states = world.store.event_to_states(payment.context()).await.unwrap();
+        let states = world
+            .store
+            .event_to_states(payment.context())
+            .await
+            .unwrap();
         assert!(!states.contains(&PaymentState::Committed));
         assert_eq!(world.store.consumption_count().await.unwrap(), 1);
         world.store.close().await;
@@ -1718,6 +1883,89 @@ enum Outcome {
     }
 
     #[tokio::test]
+    async fn oracle_commit_is_accepted_once() {
+        let mut body = unsigned_body([0x91; 32], "10000", NOW + 30);
+        let issued = oracle_issue(&body);
+        assert_eq!(issued["verdict"], "COMMIT");
+        let evidence = issued["decisionEvidence"].clone();
+        assert!(evidence
+            .get("signature")
+            .and_then(|value| value.as_str())
+            .is_some());
+
+        let checked = verify::accept_local(&body, NOW).unwrap();
+        let expected = crate::evidence::ExpectedBinding::for_payment(
+            payment_context(&checked).unwrap(),
+            authorization_identity(&checked),
+            settlement_action(&checked),
+        )
+        .unwrap();
+        let parsed = crate::evidence::parse_decision_evidence(&evidence).unwrap();
+        let record = crate::evidence::assess_decision(&parsed, &expected, &test_oracle()).unwrap();
+        assert_eq!(record.verdict(), crate::evidence::Verdict::Commit);
+        assert_eq!(record.decision_digest(), parsed.decision_digest().unwrap());
+
+        let mut tampered = evidence.clone();
+        tampered["reason"] = json!("tampered");
+        let tampered = crate::evidence::parse_decision_evidence(&tampered).unwrap();
+        assert_eq!(
+            crate::evidence::assess_decision(&tampered, &expected, &test_oracle()),
+            Err(crate::evidence::DecisionError::InvalidSignature)
+        );
+
+        let mut shifted = evidence.clone();
+        shifted["authorization"]["value"] = json!("0x".to_string() + &"00".repeat(31) + "01");
+        let shifted = crate::evidence::parse_decision_evidence(&shifted).unwrap();
+        assert!(crate::evidence::assess_decision(&shifted, &expected, &test_oracle()).is_err());
+
+        let refused = oracle_issue(&unsigned_body([0x92; 32], "1000001", NOW + 30));
+        assert_eq!(refused["verdict"], "NO_COMMIT");
+        assert!(refused["decisionEvidence"]["signature"].is_null());
+        assert!(crate::evidence::parse_decision_evidence(&refused["decisionEvidence"]).is_err());
+
+        body["decisionEvidence"] = evidence;
+        let settled = world(Outcome::Success, 0).await;
+        let first = settle(&settled, &body, None).await;
+        assert_eq!(first["success"], true, "{first}");
+        let again = settle(&settled, &body, None).await;
+        assert_eq!(again["success"], true, "{again}");
+        assert_eq!(again["transaction"], first["transaction"]);
+        assert_eq!(settled.relayer.sign_count(), 1);
+        assert_eq!(settled.sent.lock().unwrap().len(), 1);
+        settled.store.close().await;
+
+        let parallel = world(Outcome::Success, 0).await;
+        let mut parallel_body = unsigned_body([0x93; 32], "10000", NOW + 30);
+        let parallel_issued = oracle_issue(&parallel_body);
+        parallel_body["decisionEvidence"] = parallel_issued["decisionEvidence"].clone();
+        let other = Store::open(world_path(&parallel)).await.unwrap();
+        let (left, right) = tokio::join!(
+            settle_with(
+                &parallel.store,
+                &parallel.rpc,
+                &parallel.relayer,
+                &parallel_body
+            ),
+            settle_with(&other, &parallel.rpc, &parallel.relayer, &parallel_body)
+        );
+        assert_eq!(parallel.relayer.sign_count(), 1, "{left} {right}");
+        let sent = parallel.sent.lock().unwrap().clone();
+        assert_eq!(sent.len(), 1, "{left} {right}");
+        let parallel_sent = if left["success"] == true {
+            left["transaction"].as_str().unwrap().to_string()
+        } else {
+            right["transaction"].as_str().unwrap().to_string()
+        };
+        let retry = settle_with(&other, &parallel.rpc, &parallel.relayer, &parallel_body).await;
+        assert_eq!(retry["success"], true, "{retry}");
+        assert_eq!(retry["transaction"], parallel_sent);
+        assert_eq!(parallel.relayer.sign_count(), 1);
+        assert_eq!(parallel.sent.lock().unwrap().as_slice(), sent.as_slice());
+        other.close().await;
+        parallel.store.close().await;
+    }
+
+    #[tokio::test]
     async fn expired_lease_during_paused_sign_persists_only_the_new_claim() {
         let world = world(Outcome::Success, 0).await;
         let body = payment_body([0x89; 32], "10000");
@@ -1727,9 +1975,8 @@ enum Outcome {
         let rpc_a = world.rpc.clone();
         let relayer_a = world.relayer.clone();
         let body_a = body.clone();
-        let paused = tokio::spawn(async move {
-            settle_with(&store_a, &rpc_a, &relayer_a, &body_a).await
-        });
+        let paused =
+            tokio::spawn(async move { settle_with(&store_a, &rpc_a, &relayer_a, &body_a).await });
         let started = Instant::now();
         while !gate.entered.load(Ordering::SeqCst) {
             if started.elapsed() > Duration::from_secs(5) {
@@ -1816,7 +2063,10 @@ enum Outcome {
         assert_eq!(world.relayer.sign_count(), 1);
         reopen(&mut world).await;
         let pass = crate::settle::recover_pass(&recovery_env(&world), NOW).await;
-        assert!(matches!(pass, crate::settle::Pass::Idle | crate::settle::Pass::Inconclusive));
+        assert!(matches!(
+            pass,
+            crate::settle::Pass::Idle | crate::settle::Pass::Inconclusive
+        ));
         assert!(world.sent.lock().unwrap().is_empty());
         assert_eq!(world.relayer.sign_count(), 1);
         assert_ne!(loaded(&world, &body).await.state(), PaymentState::Settled);
@@ -2008,11 +2258,18 @@ enum Outcome {
             .raw_tx;
         world.store.close().await;
         world.store = Store::open(&world.path).await.unwrap();
-        assert_eq!(loaded(&world, &body).await.state(), PaymentState::SettlementUnknown);
+        assert_eq!(
+            loaded(&world, &body).await.state(),
+            PaymentState::SettlementUnknown
+        );
 
         let response = settle(&world, &body, None).await;
         assert_eq!(response["success"], true);
-        assert_eq!(world.relayer.sign_count(), 1, "recovery must not sign again");
+        assert_eq!(
+            world.relayer.sign_count(),
+            1,
+            "recovery must not sign again"
+        );
         let sent = world.sent.lock().unwrap().clone();
         assert_eq!(sent, vec![raw]);
         assert_eq!(loaded(&world, &body).await.state(), PaymentState::Settled);
@@ -2094,9 +2351,7 @@ enum Outcome {
         assert_eq!(a["success"], true, "{a}");
         assert_eq!(b["success"], true, "{b}");
         assert_ne!(a["transaction"], b["transaction"]);
-        let nonces = world
-            .relayer_nonces()
-            .await;
+        let nonces = world.relayer_nonces().await;
         assert_eq!(nonces, vec![3, 4]);
         assert_eq!(world.relayer.sign_count(), 2);
         let sent = world.sent.lock().unwrap().clone();
@@ -2118,7 +2373,11 @@ enum Outcome {
         assert_eq!(world.relayer.sign_count(), 1);
         let payment = loaded(&world, &body).await;
         assert_eq!(payment.state(), PaymentState::SettleFailed);
-        let states = world.store.event_to_states(payment.context()).await.unwrap();
+        let states = world
+            .store
+            .event_to_states(payment.context())
+            .await
+            .unwrap();
         assert!(states.contains(&PaymentState::SettlementUnknown));
         assert_eq!(states.last().copied(), Some(PaymentState::SettleFailed));
         let again = settle(&world, &body, None).await;
@@ -2134,7 +2393,10 @@ enum Outcome {
         let body = payment_body([0x51; 32], "10000");
         let response = settle(&world, &body, None).await;
         assert_eq!(response["success"], false);
-        assert_eq!(loaded(&world, &body).await.state(), PaymentState::SettlementUnknown);
+        assert_eq!(
+            loaded(&world, &body).await.state(),
+            PaymentState::SettlementUnknown
+        );
         let again = settle(&world, &body, None).await;
         assert_eq!(again["success"], false);
         assert_eq!(world.relayer.sign_count(), 1);
@@ -2148,12 +2410,19 @@ enum Outcome {
 
     #[tokio::test]
     async fn mismatched_transaction_or_transfer_is_not_settled() {
-        for outcome in [Outcome::BadSender, Outcome::BadTransfer, Outcome::NonCanonical] {
+        for outcome in [
+            Outcome::BadSender,
+            Outcome::BadTransfer,
+            Outcome::NonCanonical,
+        ] {
             let world = world(outcome, 0).await;
             let body = payment_body([0x61; 32], "10000");
             let response = settle(&world, &body, None).await;
             assert_eq!(response["success"], false, "{outcome:?}");
-            assert_eq!(loaded(&world, &body).await.state(), PaymentState::SettlementUnknown);
+            assert_eq!(
+                loaded(&world, &body).await.state(),
+                PaymentState::SettlementUnknown
+            );
             assert_eq!(world.relayer.sign_count(), 1);
             world.store.close().await;
         }
@@ -2161,7 +2430,11 @@ enum Outcome {
 
     #[tokio::test]
     async fn mismatched_nonce_calldata_or_unused_authorization_is_not_settled() {
-        for outcome in [Outcome::BadNonce, Outcome::BadCalldata, Outcome::AuthorizationUnused] {
+        for outcome in [
+            Outcome::BadNonce,
+            Outcome::BadCalldata,
+            Outcome::AuthorizationUnused,
+        ] {
             let world = world(outcome, 0).await;
             let body = payment_body([0x62; 32], "10000");
             let response = settle(&world, &body, None).await;
@@ -2372,7 +2645,10 @@ enum Outcome {
             .unwrap()
             .unwrap()
             .raw_tx;
-        assert_eq!(world.sent.lock().unwrap().as_slice(), &[stored.clone()]);
+        assert_eq!(
+            world.sent.lock().unwrap().as_slice(),
+            std::slice::from_ref(&stored)
+        );
         world.release_receipt.store(true, Ordering::SeqCst);
         world.store.close().await;
         world.store = Store::open(&world.path).await.unwrap();
@@ -2396,7 +2672,10 @@ enum Outcome {
         let body = payment_body([0xa1; 32], "10000");
         let stopped = settle(&world, &body, Some(StopAfter::Confirmed)).await;
         assert_eq!(stopped["success"], false, "{stopped}");
-        assert!(stopped["transaction"].as_str().unwrap_or("").starts_with("0x"));
+        assert!(stopped["transaction"]
+            .as_str()
+            .unwrap_or("")
+            .starts_with("0x"));
         assert_eq!(world.relayer.sign_count(), 1);
         assert_eq!(world.sent.lock().unwrap().len(), 1);
         assert_eq!(loaded(&world, &body).await.state(), PaymentState::Settling);
@@ -2444,7 +2723,10 @@ enum Outcome {
             .unwrap()
             .unwrap()
             .raw_tx;
-        assert_eq!(world.sent.lock().unwrap().as_slice(), &[stored.clone()]);
+        assert_eq!(
+            world.sent.lock().unwrap().as_slice(),
+            std::slice::from_ref(&stored)
+        );
         world.store.close().await;
         world.store = Store::open(&world.path).await.unwrap();
         assert_eq!(
@@ -2459,7 +2741,10 @@ enum Outcome {
             PaymentState::SettlementUnknown
         );
         assert_eq!(world.relayer.sign_count(), 1);
-        assert_eq!(world.sent.lock().unwrap().as_slice(), &[stored.clone()]);
+        assert_eq!(
+            world.sent.lock().unwrap().as_slice(),
+            std::slice::from_ref(&stored)
+        );
         assert_eq!(world.store.payment_count().await.unwrap(), 1);
         world.store.close().await;
         world.store = Store::open(&world.path).await.unwrap();
@@ -2790,10 +3075,7 @@ enum Outcome {
                 return;
             }
             if started.elapsed() > Duration::from_secs(3) {
-                panic!(
-                    "payment stayed {:?}",
-                    loaded(world, body).await.state()
-                );
+                panic!("payment stayed {:?}", loaded(world, body).await.state());
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -2881,7 +3163,10 @@ enum Outcome {
 
     async fn world_delayed(outcome: Outcome, pending: u64, preflight_delay: Duration) -> World {
         let relayer = Relayer::from_secret([0x24; 32]).unwrap();
-        let release_receipt = Arc::new(AtomicBool::new(!matches!(outcome, Outcome::WithheldReceipt)));
+        let release_receipt = Arc::new(AtomicBool::new(!matches!(
+            outcome,
+            Outcome::WithheldReceipt
+        )));
         let receipt_poll = Arc::new(Mutex::new(Vec::new()));
         let rpc_errors = Arc::new(AtomicUsize::new(0));
         let (rpc, sent) = mock_rpc(
@@ -2996,6 +3281,59 @@ enum Outcome {
         &world.path
     }
 
+    /// In-process issuer for the Oracle Payment Evidence Contract.
+    ///
+    /// Amounts above one USDC stay unsigned `NO_COMMIT`. Every smaller amount
+    /// is signed here over the facilitator digest with the test Oracle key.
+    /// No external checkout or interpreter is consulted.
+    fn oracle_issue(payment: &Value) -> Value {
+        const MAX_PAYMENT_BASE_UNITS: u128 = 1_000_000;
+        const COMMIT_REASON: &str = "payment authorization accepted";
+        const CEILING_REASON: &str = "amount exceeds the oracle payment ceiling";
+        let amount = payment["paymentRequirements"]["amount"]
+            .as_str()
+            .expect("payment amount");
+        let units: u128 = amount.parse().expect("decimal amount");
+        let (verdict, reason) = if units > MAX_PAYMENT_BASE_UNITS {
+            (DecisionVerdict::NoCommit, CEILING_REASON)
+        } else {
+            (DecisionVerdict::Commit, COMMIT_REASON)
+        };
+        let checked = verify::accept_local(payment, NOW).expect("oracle payment");
+        let action = settlement_action(&checked);
+        let context = payment_context(&checked).expect("oracle context");
+        let decision = crate::evidence::DecisionBody::new(
+            crate::evidence::action_id_from_digest(&action).unwrap(),
+            action,
+            context,
+            authorization_identity(&checked),
+            verdict,
+            crate::evidence::DecisionReason::try_new(reason).unwrap(),
+            crate::evidence::EvidenceId::new(checked.authorization.nonce),
+        )
+        .unwrap();
+        let digest = decision.decision_digest().unwrap();
+        let mut evidence = crate::evidence::unsigned_decision_evidence_value(&decision);
+        if verdict == DecisionVerdict::Commit {
+            let signature = test_sign(&ORACLE_SECRET, &digest);
+            evidence["signature"] = json!(format!("0x{}", hex_encode(&signature)));
+            return json!({
+                "verdict": "COMMIT",
+                "reason": reason,
+                "decisionDigest": format!("0x{}", hex_encode(&digest)),
+                "oracleAddress": to_checksum(&test_oracle()),
+                "decisionEvidence": evidence,
+            });
+        }
+        json!({
+            "verdict": "NO_COMMIT",
+            "reason": reason,
+            "decisionDigest": format!("0x{}", hex_encode(&digest)),
+            "oracleAddress": Value::Null,
+            "decisionEvidence": evidence,
+        })
+    }
+
     fn unsigned_body(nonce: [u8; 32], amount: &str, valid_before: u64) -> Value {
         let secret = [0x42u8; 32];
         let from = test_address(&secret);
@@ -3089,7 +3427,7 @@ enum Outcome {
                     let method = request["method"].as_str().unwrap_or("");
                     if method == "eth_getTransactionReceipt"
                         && rpc_errors
-                            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                            .try_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
                                 left.checked_sub(1)
                             })
                             .is_ok()
@@ -3115,7 +3453,9 @@ enum Outcome {
                         "eth_call" => json!(eth_call_result(&request, &recorded, outcome)),
                         "eth_getBlockByNumber" => json!(block_result(&request, outcome)),
                         "eth_sendRawTransaction" => json!(send_raw(&request, &recorded)),
-                        "eth_getTransactionByHash" => transaction_result(&request, &recorded, &relayer, outcome),
+                        "eth_getTransactionByHash" => {
+                            transaction_result(&request, &recorded, &relayer, outcome)
+                        }
                         "eth_getTransactionReceipt" => {
                             receipt_result(&request, &recorded, outcome, &release_receipt)
                         }
@@ -3127,7 +3467,9 @@ enum Outcome {
                             }));
                         }
                     };
-                    if method == "eth_getTransactionReceipt" && matches!(outcome, Outcome::ReceiptError) {
+                    if method == "eth_getTransactionReceipt"
+                        && matches!(outcome, Outcome::ReceiptError)
+                    {
                         return Json(json!({
                             "jsonrpc": "2.0",
                             "id": 1,
@@ -3149,9 +3491,16 @@ enum Outcome {
         (rpc, sent)
     }
 
-    fn eth_call_result(request: &Value, sent: &Arc<Mutex<Vec<Vec<u8>>>>, outcome: Outcome) -> Value {
+    fn eth_call_result(
+        request: &Value,
+        sent: &Arc<Mutex<Vec<Vec<u8>>>>,
+        outcome: Outcome,
+    ) -> Value {
         let data = request["params"][0]["data"].as_str().unwrap_or("");
-        let state = format!("0x{}", hex_encode(&crate::chain::authorization_state_selector()));
+        let state = format!(
+            "0x{}",
+            hex_encode(&crate::chain::authorization_state_selector())
+        );
         let balance = format!("0x{}", hex_encode(&crate::chain::balance_of_selector()));
         if data.starts_with(&state) {
             let used = !sent.lock().unwrap().is_empty()
@@ -3280,7 +3629,11 @@ enum Outcome {
 
     fn find_raw(request: &Value, sent: &Arc<Mutex<Vec<Vec<u8>>>>) -> Option<Vec<u8>> {
         let wanted = request["params"][0].as_str().unwrap_or("");
-        sent.lock().unwrap().iter().find(|raw| hash_hex(transaction_hash(raw)) == wanted).cloned()
+        sent.lock()
+            .unwrap()
+            .iter()
+            .find(|raw| hash_hex(transaction_hash(raw)) == wanted)
+            .cloned()
     }
 
     fn pad_topic(address: &[u8]) -> [u8; 32] {
@@ -3296,7 +3649,7 @@ enum Outcome {
 
     fn decode_hex(value: &str) -> Option<Vec<u8>> {
         let hex = value.strip_prefix("0x").unwrap_or(value);
-        if hex.len() % 2 != 0 {
+        if !hex.len().is_multiple_of(2) {
             return None;
         }
         let bytes = hex.as_bytes();

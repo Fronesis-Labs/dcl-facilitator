@@ -93,7 +93,9 @@ impl Config {
         let receipt_timeout = match get("SETTLE_RECEIPT_TIMEOUT_SECS") {
             None => DEFAULT_RECEIPT_TIMEOUT,
             Some(raw) => {
-                let seconds = raw.parse::<u64>().map_err(|_| ConfigError::ReceiptTimeout)?;
+                let seconds = raw
+                    .parse::<u64>()
+                    .map_err(|_| ConfigError::ReceiptTimeout)?;
                 if !(1..=120).contains(&seconds) {
                     return Err(ConfigError::ReceiptTimeout);
                 }
@@ -162,9 +164,7 @@ fn is_inside(root: &Path, path: &Path) -> bool {
     let root = compare_key(root);
     let path = compare_key(path);
     let root = root.trim_end_matches(['\\', '/']);
-    path == root
-        || path.starts_with(&format!("{root}\\"))
-        || path.starts_with(&format!("{root}/"))
+    path == root || path.starts_with(&format!("{root}\\")) || path.starts_with(&format!("{root}/"))
 }
 
 fn compare_key(path: &Path) -> String {
@@ -262,9 +262,8 @@ mod tests {
         });
         assert_eq!(relative.unwrap_err(), ConfigError::SettlerKey);
 
-        let unpaired = Config::from_lookup(|key| {
-            (key == "SETTLER_MAX_FEE_PER_GAS").then(|| "1".to_string())
-        });
+        let unpaired =
+            Config::from_lookup(|key| (key == "SETTLER_MAX_FEE_PER_GAS").then(|| "1".to_string()));
         assert_eq!(unpaired.unwrap_err(), ConfigError::SettlerKey);
 
         let zero = Config::from_lookup(|key| match key {
@@ -283,7 +282,8 @@ mod tests {
         .unwrap();
         assert_eq!(ok.base_rpc_url.as_deref(), Some("http://127.0.0.1:8545"));
 
-        let bad = Config::from_lookup(|k| (k == "BASE_RPC_URL").then(|| "file:///tmp/x".to_string()));
+        let bad =
+            Config::from_lookup(|k| (k == "BASE_RPC_URL").then(|| "file:///tmp/x".to_string()));
         assert_eq!(bad.unwrap_err(), ConfigError::RpcUrl);
     }
 

@@ -50,13 +50,15 @@ impl Handle {
         let stop_for_task = Arc::clone(&stop);
         let join = tokio::spawn(async move {
             run(
-                rpc,
-                store,
-                relayer,
-                oracle,
-                max_fee_per_gas,
-                receipt_timeout,
-                now,
+                RecoveryTask {
+                    rpc,
+                    store,
+                    relayer,
+                    oracle,
+                    max_fee_per_gas,
+                    receipt_timeout,
+                    now,
+                },
                 watch_rx,
                 stop_for_task,
             )
@@ -97,7 +99,7 @@ pub fn unix_now() -> Option<u64> {
         .map(|duration| duration.as_secs())
 }
 
-async fn run(
+struct RecoveryTask {
     rpc: BaseRpc,
     store: Store,
     relayer: Relayer,
@@ -105,9 +107,18 @@ async fn run(
     max_fee_per_gas: u128,
     receipt_timeout: Duration,
     now: Arc<dyn Fn() -> Option<u64> + Send + Sync>,
-    mut shutdown: watch::Receiver<bool>,
-    stop: Arc<AtomicBool>,
-) {
+}
+
+async fn run(task: RecoveryTask, mut shutdown: watch::Receiver<bool>, stop: Arc<AtomicBool>) {
+    let RecoveryTask {
+        rpc,
+        store,
+        relayer,
+        oracle,
+        max_fee_per_gas,
+        receipt_timeout,
+        now,
+    } = task;
     tracing::info!("settlement recovery worker started");
     let mut delay = BACKOFF_BASE;
     loop {

@@ -13,9 +13,7 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use serde_json::Value;
-#[cfg(test)]
-use serde_json::json;
+use serde_json::{json, Value};
 
 use crate::chain::{keccak, recover_signer};
 use crate::leibniz::{ActionDigest, PaymentContext};
@@ -364,12 +362,7 @@ pub struct AuditEvidence {
 }
 
 impl AuditEvidence {
-    pub fn new(
-        sequence: u64,
-        event_id: [u8; 32],
-        previous_link: [u8; 32],
-        link: [u8; 32],
-    ) -> Self {
+    pub fn new(sequence: u64, event_id: [u8; 32], previous_link: [u8; 32], link: [u8; 32]) -> Self {
         Self {
             sequence,
             event_id,
@@ -513,7 +506,11 @@ pub struct PaymentKey {
 }
 
 impl PaymentKey {
-    pub(crate) fn new(network: impl Into<String>, payer: impl Into<String>, nonce: impl Into<String>) -> Self {
+    pub(crate) fn new(
+        network: impl Into<String>,
+        payer: impl Into<String>,
+        nonce: impl Into<String>,
+    ) -> Self {
         Self {
             network: network.into(),
             payer: payer.into(),
@@ -634,7 +631,9 @@ impl MemoryConsumption {
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, MemoryState> {
-        self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }
 
@@ -729,7 +728,14 @@ pub(crate) fn authorization_digest_for(
     let nonce = decode_word(&canonical_nonce(context.nonce())?)?;
     let chain = chain_of_network(context.network())?;
     Ok(AuthorizationIdentity::new(
-        chain, asset, payer, recipient, value, valid_after, valid_before, nonce,
+        chain,
+        asset,
+        payer,
+        recipient,
+        value,
+        valid_after,
+        valid_before,
+        nonce,
     )
     .digest())
 }
@@ -755,7 +761,11 @@ fn bound_record(
         return Err(DecisionError::NotBound);
     }
     let payment_key = payment_key_of(evidence.body.payment_context())?;
-    consistent(&payment_key, evidence.body.payment_context(), &evidence.body.authorization)?;
+    consistent(
+        &payment_key,
+        evidence.body.payment_context(),
+        &evidence.body.authorization,
+    )?;
     Ok(Bound {
         authorization_digest: evidence.body.authorization.digest(),
         payment_key,
@@ -903,7 +913,7 @@ fn address_hex(address: &[u8; 20]) -> String {
     format!("0x{}", hex_encode(address))
 }
 
-fn hex_encode(bytes: &[u8]) -> String {
+pub(crate) fn hex_encode(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
@@ -940,7 +950,6 @@ fn concat_words(words: &[[u8; 32]]) -> Vec<u8> {
     out
 }
 
-#[cfg(test)]
 fn verdict_label(verdict: Verdict) -> &'static str {
     match verdict {
         Verdict::Commit => "COMMIT",
@@ -963,9 +972,7 @@ fn parse_verdict(value: &str) -> Result<Verdict, DecisionError> {
 /// [`action_id_from_digest`], without a prefix.
 pub(crate) fn parse_decision_evidence(value: &Value) -> Result<DclDecisionEvidence, DecisionError> {
     let object = value.as_object().ok_or(DecisionError::Malformed)?;
-    let action_id = ActionId::try_new(
-        required_str(object.get("actionId"))?.to_string(),
-    )?;
+    let action_id = ActionId::try_new(required_str(object.get("actionId"))?.to_string())?;
     let action_digest = ActionDigest::new(parse_word(required_str(object.get("actionDigest"))?)?);
     let context_value = object.get("context").ok_or(DecisionError::Malformed)?;
     let context_object = context_value.as_object().ok_or(DecisionError::Malformed)?;
@@ -977,7 +984,9 @@ pub(crate) fn parse_decision_evidence(value: &Value) -> Result<DclDecisionEviden
         required_str(context_object.get("nonce"))?,
     )
     .map_err(|_| DecisionError::Malformed)?;
-    let authorization_value = object.get("authorization").ok_or(DecisionError::Malformed)?;
+    let authorization_value = object
+        .get("authorization")
+        .ok_or(DecisionError::Malformed)?;
     let authorization_object = authorization_value
         .as_object()
         .ok_or(DecisionError::Malformed)?;
@@ -1038,9 +1047,9 @@ fn parse_signature(value: &str) -> Result<[u8; 65], DecisionError> {
     Ok(out)
 }
 
-#[cfg(test)]
-pub(crate) fn decision_evidence_value(evidence: &DclDecisionEvidence) -> Value {
-    let body = evidence.body();
+/// `decisionEvidence` object without a signature. Field formatting matches
+/// [`parse_decision_evidence`].
+pub(crate) fn unsigned_decision_evidence_value(body: &DecisionBody) -> Value {
     let authorization = body.authorization();
     let context = body.payment_context();
     json!({
@@ -1049,7 +1058,6 @@ pub(crate) fn decision_evidence_value(evidence: &DclDecisionEvidence) -> Value {
         "verdict": verdict_label(body.verdict()),
         "reason": body.reason().as_str(),
         "evidenceId": format!("0x{}", hex_encode(body.evidence_id().as_bytes())),
-        "signature": format!("0x{}", hex_encode(evidence.signature())),
         "context": {
             "network": context.network(),
             "payer": context.payer(),
@@ -1068,6 +1076,23 @@ pub(crate) fn decision_evidence_value(evidence: &DclDecisionEvidence) -> Value {
             "nonce": format!("0x{}", hex_encode(&authorization.nonce())),
         }
     })
+}
+
+#[cfg(test)]
+pub(crate) fn decision_evidence_value(evidence: &DclDecisionEvidence) -> Value {
+    let mut unsigned = unsigned_decision_evidence_value(evidence.body());
+    let map = unsigned.as_object_mut().expect("decision evidence object");
+    let mut signed = serde_json::Map::new();
+    for (key, value) in map.iter() {
+        if key == "context" {
+            signed.insert(
+                "signature".to_string(),
+                json!(format!("0x{}", hex_encode(evidence.signature()))),
+            );
+        }
+        signed.insert(key.clone(), value.clone());
+    }
+    Value::Object(signed)
 }
 
 #[cfg(test)]
@@ -1179,7 +1204,9 @@ mod tests {
         let encoded = canonical_payment_context(&context).unwrap();
         let asset = address_hex(&USDC_ADDRESS);
         assert_eq!(asset.len(), 42);
-        assert!(to_checksum(&USDC_ADDRESS).chars().any(|ch| ch.is_ascii_uppercase()));
+        assert!(to_checksum(&USDC_ADDRESS)
+            .chars()
+            .any(|ch| ch.is_ascii_uppercase()));
         assert_ne!(context.asset(), asset);
 
         let mut expected = Vec::new();
@@ -1249,7 +1276,10 @@ mod tests {
         assert_eq!(stored.decision_digest(), token.decision_digest());
         assert_eq!(stored.authorization_digest(), token.authorization_digest());
         assert_eq!(stored.verdict(), Verdict::Commit);
-        assert_eq!(stored.payment_key().payer(), address_hex(&authorization().payer()));
+        assert_eq!(
+            stored.payment_key().payer(),
+            address_hex(&authorization().payer())
+        );
         assert_eq!(consumption.len(), 1);
 
         let second = validate_decision(&evidence, &expected, &oracle, &consumption).unwrap();
@@ -1360,16 +1390,14 @@ mod tests {
         let expected = expected_for(&body);
         let evidence = signed(body, &secret);
         let consumption = MemoryConsumption::new();
-        let outcome = validate_decision(
-            &evidence,
-            &expected,
-            &test_address(&secret),
-            &consumption,
-        )
-        .unwrap();
+        let outcome =
+            validate_decision(&evidence, &expected, &test_address(&secret), &consumption).unwrap();
         assert!(matches!(outcome, DecisionOutcome::NoCommit(_)));
         assert_eq!(
-            consumption.get(&EvidenceId::new([0xab; 32])).unwrap().verdict(),
+            consumption
+                .get(&EvidenceId::new([0xab; 32]))
+                .unwrap()
+                .verdict(),
             Verdict::NoCommit
         );
 
@@ -1455,10 +1483,7 @@ mod tests {
 
     #[test]
     fn malformed_identity_is_rejected_before_consumption() {
-        assert_eq!(
-            ActionId::try_new("").unwrap_err(),
-            DecisionError::Malformed
-        );
+        assert_eq!(ActionId::try_new("").unwrap_err(), DecisionError::Malformed);
         assert_eq!(
             DecisionReason::try_new("").unwrap_err(),
             DecisionError::Malformed
@@ -1492,10 +1517,7 @@ mod tests {
         body.payment_context = context;
         let evidence = DclDecisionEvidence::certify(body, &[0x11; 65]).unwrap();
         let expected = expected_for(evidence.body());
-        assert_eq!(
-            evidence.decision_digest(),
-            Err(DecisionError::Malformed)
-        );
+        assert_eq!(evidence.decision_digest(), Err(DecisionError::Malformed));
         assert_eq!(
             validate_decision(&evidence, &expected, &oracle, &consumption),
             Err(DecisionError::Malformed)
@@ -1519,7 +1541,10 @@ mod tests {
                 validate_decision(&evidence, &expected, &oracle, consumption.as_ref())
             }));
         }
-        let outcomes: Vec<_> = handles.into_iter().map(|handle| handle.join().unwrap()).collect();
+        let outcomes: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect();
         assert!(outcomes.iter().all(|outcome| outcome.is_ok()));
         assert_eq!(consumption.len(), 1);
 
@@ -1542,10 +1567,7 @@ mod tests {
             .into_iter()
             .map(|handle| handle.join().unwrap())
             .collect();
-        let committed = raced
-            .iter()
-            .filter(|outcome| outcome.is_ok())
-            .count();
+        let committed = raced.iter().filter(|outcome| outcome.is_ok()).count();
         let consumed = raced
             .iter()
             .filter(|outcome| outcome == &&Err(DecisionError::Consumed))

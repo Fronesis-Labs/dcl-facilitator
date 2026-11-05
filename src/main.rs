@@ -9,6 +9,16 @@ use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut args = std::env::args().skip(1);
+    if args.next().as_deref() == Some("evidence") {
+        let rest: Vec<String> = args.collect();
+        if let Err(err) = dcl_facilitator::prepare::write_evidence(&rest) {
+            eprintln!("{err}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
@@ -17,12 +27,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let cfg = Config::from_env()?;
     let rpc = match cfg.base_rpc_url.as_deref() {
-        Some(url) => Some(BaseRpc::connect(url).map_err(|_| {
-            std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "failed to build the Base RPC client",
-            )
-        })?),
+        Some(url) => Some(
+            BaseRpc::connect(url)
+                .map_err(|_| std::io::Error::other("failed to build the Base RPC client"))?,
+        ),
         None => None,
     };
     let store = match cfg.database_path.as_deref() {
@@ -30,9 +38,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => None,
     };
     let relayer = match cfg.settler_key_file.as_deref() {
-        Some(path) => Some(Relayer::from_file(Path::new(path)).map_err(|_| {
-            std::io::Error::new(std::io::ErrorKind::Other, "invalid settler key file")
-        })?),
+        Some(path) => Some(
+            Relayer::from_file(Path::new(path))
+                .map_err(|_| std::io::Error::other("invalid settler key file"))?,
+        ),
         None => None,
     };
     if cfg.settler_key_file.is_some() && cfg.oracle_address.is_none() {
@@ -47,7 +56,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cfg.receipt_timeout,
     );
     let recovery = state.spawn_recovery();
-    let stop_recovery = recovery.as_ref().map(dcl_facilitator::recover::Handle::stopper);
+    let stop_recovery = recovery
+        .as_ref()
+        .map(dcl_facilitator::recover::Handle::stopper);
     let addr = SocketAddr::new(cfg.host, cfg.port);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(

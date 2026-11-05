@@ -15,6 +15,7 @@ pub mod error;
 pub mod evidence;
 pub mod leibniz;
 pub mod machine;
+pub mod prepare;
 pub mod recover;
 pub mod settle;
 pub mod store;

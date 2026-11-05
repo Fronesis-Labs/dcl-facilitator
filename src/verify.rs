@@ -87,11 +87,7 @@ pub(crate) fn accept_replay(body: &Value) -> Result<Checked, (String, Option<Str
     admit(body, 0, false)
 }
 
-fn admit(
-    body: &Value,
-    now: u64,
-    window: bool,
-) -> Result<Checked, (String, Option<String>)> {
+fn admit(body: &Value, now: u64, window: bool) -> Result<Checked, (String, Option<String>)> {
     let checked = check_local(body, now, window)?;
     let digest = signing_digest(&checked.authorization);
     match recover_signer(&digest, &checked.signature) {
@@ -142,11 +138,7 @@ pub(crate) async fn accept_chain(
     }
 }
 
-fn check_local(
-    body: &Value,
-    now: u64,
-    window: bool,
-) -> Result<Checked, (String, Option<String>)> {
+fn check_local(body: &Value, now: u64, window: bool) -> Result<Checked, (String, Option<String>)> {
     let root = body
         .as_object()
         .ok_or_else(|| fail(INVALID_PAYLOAD, None))?;
@@ -188,7 +180,11 @@ fn check_local(
     {
         return Err(fail(INVALID_PAYMENT_REQUIREMENTS, None));
     }
-    if accepted.transfer_method.as_deref().unwrap_or(TRANSFER_METHOD) != TRANSFER_METHOD
+    if accepted
+        .transfer_method
+        .as_deref()
+        .unwrap_or(TRANSFER_METHOD)
+        != TRANSFER_METHOD
         || accepted.payment_flow.as_deref().unwrap_or(PAYMENT_FLOW) != PAYMENT_FLOW
     {
         return Err(fail(INVALID_PAYMENT_REQUIREMENTS, None));
@@ -196,8 +192,8 @@ fn check_local(
 
     let exact = object_field(payload.get("payload"), INVALID_PAYLOAD)?;
     let authorization = object_field(exact.get("authorization"), INVALID_PAYLOAD)?;
-    let from =
-        parse_address(required_str(authorization.get("from"))?).map_err(|_| fail(INVALID_PAYLOAD, None))?;
+    let from = parse_address(required_str(authorization.get("from"))?)
+        .map_err(|_| fail(INVALID_PAYLOAD, None))?;
     let payer = to_checksum(&from);
     let to = parse_address(required_str(authorization.get("to"))?)
         .map_err(|_| fail(INVALID_PAYLOAD, Some(payer.clone())))?;
@@ -341,7 +337,9 @@ fn parse_address(value: &str) -> Result<[u8; 20], ()> {
 }
 
 fn parse_bytes32(value: &str) -> Option<[u8; 32]> {
-    let hex = value.strip_prefix("0x").or_else(|| value.strip_prefix("0X"))?;
+    let hex = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))?;
     if hex.len() != 64 {
         return None;
     }
@@ -352,7 +350,9 @@ fn parse_bytes32(value: &str) -> Option<[u8; 32]> {
 }
 
 fn parse_signature(value: &str) -> Option<[u8; 65]> {
-    let hex = value.strip_prefix("0x").or_else(|| value.strip_prefix("0X"))?;
+    let hex = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))?;
     if hex.len() != 130 {
         return None;
     }
@@ -392,7 +392,7 @@ fn u64_word(value: u64) -> [u8; 32] {
 
 fn decode_hex(value: &str) -> Option<Vec<u8>> {
     let bytes = value.as_bytes();
-    if bytes.len() % 2 != 0 {
+    if !bytes.len().is_multiple_of(2) {
         return None;
     }
     let mut out = Vec::with_capacity(bytes.len() / 2);

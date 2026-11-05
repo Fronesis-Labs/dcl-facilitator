@@ -28,10 +28,7 @@ async fn post_fixture(name: &str) -> (StatusCode, Value) {
 #[tokio::test]
 async fn fixtures_reject_without_calling_a_facilitator_or_reporting_success() {
     let cases = [
-        (
-            "verify_wrong_network.json",
-            "invalid_network",
-        ),
+        ("verify_wrong_network.json", "invalid_network"),
         (
             "verify_amount_mismatch.json",
             "invalid_exact_evm_payload_authorization_value_mismatch",

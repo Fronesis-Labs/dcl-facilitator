@@ -10,7 +10,9 @@ use std::sync::Arc;
 
 use k256::ecdsa::SigningKey;
 
-use super::eip3009::{keccak, recover_signer, to_checksum, ChainError, BASE_CHAIN_ID, USDC_ADDRESS};
+use super::eip3009::{
+    keccak, recover_signer, to_checksum, ChainError, BASE_CHAIN_ID, USDC_ADDRESS,
+};
 
 #[derive(Clone)]
 pub struct Relayer {
@@ -164,7 +166,9 @@ pub fn recover_sender(raw: &[u8]) -> Result<[u8; 20], ChainError> {
     recover_signer(&hash, &signature)
 }
 
-fn split_signed(raw: &[u8]) -> Result<(Vec<Vec<u8>>, u8, [u8; 32], [u8; 32]), ChainError> {
+type SplitSigned = (Vec<Vec<u8>>, u8, [u8; 32], [u8; 32]);
+
+fn split_signed(raw: &[u8]) -> Result<SplitSigned, ChainError> {
     if raw.first() != Some(&0x02) {
         return Err(ChainError::Signature);
     }
@@ -290,7 +294,10 @@ fn prefix(offset: u8, len: usize) -> Vec<u8> {
 }
 
 fn trim_be(bytes: &[u8]) -> &[u8] {
-    let start = bytes.iter().position(|byte| *byte != 0).unwrap_or(bytes.len());
+    let start = bytes
+        .iter()
+        .position(|byte| *byte != 0)
+        .unwrap_or(bytes.len());
     &bytes[start..]
 }
 
@@ -383,7 +390,10 @@ fn u128_from(bytes: &[u8]) -> Result<u128, ChainError> {
 
 fn address_from(bytes: &[u8]) -> Result<[u8; 20], ChainError> {
     let mut address = [0u8; 20];
-    address.copy_from_slice(bytes.try_into().map_err(|_| ChainError::Signature)?);
+    if bytes.len() != 20 {
+        return Err(ChainError::Signature);
+    }
+    address.copy_from_slice(bytes);
     Ok(address)
 }
 
@@ -397,7 +407,7 @@ fn pad32(bytes: &[u8]) -> Result<[u8; 32], ChainError> {
 }
 
 fn decode_hex(value: &str) -> Option<Vec<u8>> {
-    if value.len() % 2 != 0 {
+    if !value.len().is_multiple_of(2) {
         return None;
     }
     let bytes = value.as_bytes();
@@ -449,10 +459,16 @@ mod tests {
     #[test]
     fn key_file_is_one_hex_scalar() {
         let path = std::env::temp_dir().join(format!("dcl-key-{}-only", std::process::id()));
-        std::fs::write(&path, "0x2424242424242424242424242424242424242424242424242424242424242424\n")
-            .unwrap();
+        std::fs::write(
+            &path,
+            "0x2424242424242424242424242424242424242424242424242424242424242424\n",
+        )
+        .unwrap();
         let loaded = Relayer::from_file(&path).unwrap();
-        assert_eq!(loaded.address(), Relayer::from_secret([0x24; 32]).unwrap().address());
+        assert_eq!(
+            loaded.address(),
+            Relayer::from_secret([0x24; 32]).unwrap().address()
+        );
         let _ = std::fs::remove_file(&path);
         assert!(Relayer::from_file(Path::new("relative.key")).is_err());
     }

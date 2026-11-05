@@ -18,3 +18,17 @@
 *.keystore
 keystore.json
 wallet.json
+
+*.mnemonic
+*.seed
+*mnemonic*
+*seed-phrase*
+*seed_phrase*
+*seedphrase*
+*wallet-secret*
+*wallet_secret*
+*wallet.secret
+*private-key*
+*private_key*
+*privatekey*
+*.priv

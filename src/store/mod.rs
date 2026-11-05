@@ -17,7 +17,7 @@ use tokio::sync::Mutex;
 use crate::chain::transaction_hash;
 use crate::evidence::{
     authorization_digest_for, payment_key_of, same_consumption, ActionId, AuthorizationIdentity,
-    ConsumptionRecord, DecisionBody, DecisionReason, DclDecisionEvidence, EvidenceId, PaymentKey,
+    ConsumptionRecord, DclDecisionEvidence, DecisionBody, DecisionReason, EvidenceId, PaymentKey,
     Verdict,
 };
 use crate::leibniz::{ActionDigest, Commit, Decision, PaymentContext};
@@ -60,6 +60,18 @@ struct Inner {
     /// Test hook reached after `Relayer::sign` and before `commit_signed`.
     #[cfg(test)]
     sign_gate: Mutex<Option<Arc<SignGate>>>,
+}
+
+/// One verified Oracle `COMMIT` and the relayer transaction stored with it.
+#[derive(Clone, Copy)]
+pub struct SignedCommit<'a> {
+    pub context: &'a PaymentContext,
+    pub action: &'a ActionDigest,
+    pub commit: &'a Commit,
+    pub signed: &'a SignedSettlement,
+    pub record: &'a ConsumptionRecord,
+    pub evidence: &'a DclDecisionEvidence,
+    pub claim: &'a SigningClaim,
 }
 
 impl Store {
@@ -131,15 +143,14 @@ impl Store {
         payer: &str,
         nonce: &str,
     ) -> Result<Payment, StoreError> {
-        let row = sqlx::query(
-            "SELECT * FROM payments WHERE network = ? AND payer = ? AND nonce = ?",
-        )
-        .bind(network)
-        .bind(payer)
-        .bind(nonce)
-        .fetch_optional(&self.inner.pool)
-        .await?
-        .ok_or(StoreError::NotFound)?;
+        let row =
+            sqlx::query("SELECT * FROM payments WHERE network = ? AND payer = ? AND nonce = ?")
+                .bind(network)
+                .bind(payer)
+                .bind(nonce)
+                .fetch_optional(&self.inner.pool)
+                .await?
+                .ok_or(StoreError::NotFound)?;
         payment_from_row(&row)
     }
 
@@ -226,10 +237,7 @@ impl Store {
     /// state and until signing and the receipt outcome have finished.
     /// The key is the payment identity `(network, payer, nonce)`, which is
     /// the row that owns a single `payment_id`.
-    pub async fn lock_payment(
-        &self,
-        context: &PaymentContext,
-    ) -> tokio::sync::OwnedMutexGuard<()> {
+    pub async fn lock_payment(&self, context: &PaymentContext) -> tokio::sync::OwnedMutexGuard<()> {
         let key = format!(
             "{}\n{}\n{}",
             context.network(),
@@ -314,28 +322,9 @@ impl Store {
     /// The `claim` is the inter-process right to sign, taken before
     /// `Relayer::sign`. A different claim, or none, rolls this transition back.
     /// Callers broadcast only after this returns.
-    pub async fn commit_signed(
-        &self,
-        context: &PaymentContext,
-        action: &ActionDigest,
-        commit: &Commit,
-        signed: &SignedSettlement,
-        record: &ConsumptionRecord,
-        evidence: &DclDecisionEvidence,
-        claim: &SigningClaim,
-    ) -> Result<Payment, StoreError> {
+    pub async fn commit_signed(&self, write: SignedCommit<'_>) -> Result<Payment, StoreError> {
         let mut tx = self.begin_write().await?;
-        let result = commit_signed_inner(
-            &mut tx.conn,
-            context,
-            action,
-            commit,
-            signed,
-            record,
-            evidence,
-            claim,
-        )
-        .await;
+        let result = commit_signed_inner(&mut tx.conn, write).await;
         tx.finish(result).await
     }
 
@@ -405,8 +394,7 @@ impl Store {
         evidence: &DclDecisionEvidence,
     ) -> Result<Payment, StoreError> {
         let mut tx = self.begin_write().await?;
-        let result =
-            refuse_inner(&mut tx.conn, context, action, decision, record, evidence).await;
+        let result = refuse_inner(&mut tx.conn, context, action, decision, record, evidence).await;
         tx.finish(result).await
     }
 
@@ -638,10 +626,8 @@ impl Store {
 
     #[cfg(test)]
     pub async fn overwrite_decision_reason(&self, reason: &str) -> Result<(), StoreError> {
-        self.write_sql(
-            sqlx::query("UPDATE decision_consumptions SET reason = ?").bind(reason),
-        )
-        .await
+        self.write_sql(sqlx::query("UPDATE decision_consumptions SET reason = ?").bind(reason))
+            .await
     }
 
     #[cfg(test)]
@@ -729,10 +715,8 @@ impl Store {
 
     #[cfg(test)]
     pub async fn overwrite_payer_signature(&self, signature: &[u8]) -> Result<(), StoreError> {
-        self.write_sql(
-            sqlx::query("UPDATE settlement_evidence SET signature = ?").bind(signature),
-        )
-        .await
+        self.write_sql(sqlx::query("UPDATE settlement_evidence SET signature = ?").bind(signature))
+            .await
     }
 
     #[cfg(test)]
@@ -744,14 +728,12 @@ impl Store {
     ) -> Result<(), StoreError> {
         let mut tx = self.begin_write().await?;
         let result = async {
-            sqlx::query(
-                "UPDATE settlement_evidence SET raw_tx = ?, tx_hash = ?, calldata = ?",
-            )
-            .bind(raw)
-            .bind(hash)
-            .bind(calldata)
-            .execute(&mut *tx.conn)
-            .await?;
+            sqlx::query("UPDATE settlement_evidence SET raw_tx = ?, tx_hash = ?, calldata = ?")
+                .bind(raw)
+                .bind(hash)
+                .bind(calldata)
+                .execute(&mut *tx.conn)
+                .await?;
             sqlx::query("UPDATE decision_consumptions SET raw_tx_hash = ?")
                 .bind(hash)
                 .execute(&mut *tx.conn)
@@ -838,9 +820,7 @@ impl Store {
     async fn begin_write(&self) -> Result<WriteTx<'_>, StoreError> {
         let guard = self.inner.write.lock().await;
         let mut conn = self.inner.pool.acquire().await?;
-        sqlx::query("BEGIN IMMEDIATE")
-            .execute(&mut *conn)
-            .await?;
+        sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
         Ok(WriteTx {
             _guard: guard,
             conn,
@@ -893,15 +873,14 @@ async fn record_received_inner(
     context: PaymentContext,
     action: ActionDigest,
 ) -> Result<PutOutcome, StoreError> {
-    match load_by_key(conn, context.network(), context.payer(), context.nonce()).await? {
-        Some(existing) => {
-            return if existing.context() == &context && existing.action() == &action {
-                Ok(PutOutcome::Existing(existing))
-            } else {
-                Err(StoreError::Conflict)
-            };
-        }
-        None => {}
+    if let Some(existing) =
+        load_by_key(conn, context.network(), context.payer(), context.nonce()).await?
+    {
+        return if existing.context() == &context && existing.action() == &action {
+            Ok(PutOutcome::Existing(existing))
+        } else {
+            Err(StoreError::Conflict)
+        };
     }
 
     let payment = Payment::received(context.clone(), action);
@@ -1153,7 +1132,11 @@ async fn load_decision_meta(
     }))
 }
 
-fn same_verified_commit(stored: &DecisionMeta, record: &ConsumptionRecord, payer_signature: &[u8; 65]) -> bool {
+fn same_verified_commit(
+    stored: &DecisionMeta,
+    record: &ConsumptionRecord,
+    payer_signature: &[u8; 65],
+) -> bool {
     stored.legacy_incomplete == 0
         && stored.state == "verified"
         && stored.verdict == Verdict::Commit
@@ -1359,15 +1342,10 @@ async fn release_signing_claim_inner(
 async fn promote_verified_commit(
     conn: &mut SqliteConnection,
     key: &PaymentKey,
-    record: &ConsumptionRecord,
-    evidence: &DclDecisionEvidence,
-    context: &PaymentContext,
-    action: &ActionDigest,
-    payer_signature: &[u8; 65],
+    write: &SignedCommit<'_>,
     raw_tx_hash: &[u8; 32],
-    claim: &SigningClaim,
 ) -> Result<(), StoreError> {
-    if evidence_matches(evidence, record, context, action).is_err() {
+    if evidence_matches(write.evidence, write.record, write.context, write.action).is_err() {
         return Err(StoreError::Conflict);
     }
     let updated = sqlx::query(
@@ -1390,12 +1368,12 @@ async fn promote_verified_commit(
     .bind(key.network())
     .bind(key.payer())
     .bind(key.nonce())
-    .bind(record.evidence_id().as_bytes().as_slice())
-    .bind(record.decision_digest().as_slice())
-    .bind(record.authorization_digest().as_slice())
-    .bind(payer_signature.as_slice())
-    .bind(evidence.signature().as_slice())
-    .bind(claim.token.as_slice())
+    .bind(write.record.evidence_id().as_bytes().as_slice())
+    .bind(write.record.decision_digest().as_slice())
+    .bind(write.record.authorization_digest().as_slice())
+    .bind(write.signed.signature.as_slice())
+    .bind(write.evidence.signature().as_slice())
+    .bind(write.claim.token.as_slice())
     .execute(&mut *conn)
     .await?
     .rows_affected();
@@ -1407,14 +1385,17 @@ async fn promote_verified_commit(
 
 async fn commit_signed_inner(
     conn: &mut SqliteConnection,
-    context: &PaymentContext,
-    action: &ActionDigest,
-    commit: &Commit,
-    signed: &SignedSettlement,
-    record: &ConsumptionRecord,
-    evidence: &DclDecisionEvidence,
-    claim: &SigningClaim,
+    write: SignedCommit<'_>,
 ) -> Result<Payment, StoreError> {
+    let SignedCommit {
+        context,
+        action,
+        commit,
+        signed,
+        record,
+        evidence: _,
+        claim: _,
+    } = write;
     if record.verdict() != Verdict::Commit || !commit.binds(context, action) {
         return Err(StoreError::Conflict);
     }
@@ -1436,18 +1417,7 @@ async fn commit_signed_inner(
     if raw_tx_hash != signed.tx_hash {
         return Err(StoreError::Conflict);
     }
-    promote_verified_commit(
-        conn,
-        &key,
-        record,
-        evidence,
-        context,
-        action,
-        &signed.signature,
-        &raw_tx_hash,
-        claim,
-    )
-    .await?;
+    promote_verified_commit(conn, &key, &write, &raw_tx_hash).await?;
     let row = sqlx::query("SELECT * FROM payments WHERE network = ? AND payer = ? AND nonce = ?")
         .bind(context.network())
         .bind(context.payer())
@@ -1514,7 +1484,10 @@ async fn refuse_inner(
         }
         if !matches!(
             payment.state(),
-            PaymentState::Received | PaymentState::Verified | PaymentState::Committed | PaymentState::Rejected
+            PaymentState::Received
+                | PaymentState::Verified
+                | PaymentState::Committed
+                | PaymentState::Rejected
         ) {
             return Err(StoreError::Conflict);
         }
@@ -1804,14 +1777,21 @@ fn classify_stored_commit(row: &SqliteRow) -> Result<StoredCommit, StoreError> {
         state: state.clone(),
         payer_signature,
     };
-    match (state.as_str(), decision.raw_tx_hash, decision.payer_signature) {
+    match (
+        state.as_str(),
+        decision.raw_tx_hash,
+        decision.payer_signature,
+    ) {
         ("verified", None, Some(_)) => Ok(StoredCommit::Verified(decision)),
         ("consumed", Some(_), Some(_)) => Ok(StoredCommit::Consumed(decision)),
         _ => Ok(StoredCommit::Incomplete),
     }
 }
 
-fn rebuild_evidence(row: &SqliteRow, verdict: Verdict) -> Result<Option<DclDecisionEvidence>, StoreError> {
+fn rebuild_evidence(
+    row: &SqliteRow,
+    verdict: Verdict,
+) -> Result<Option<DclDecisionEvidence>, StoreError> {
     let action_id: Option<String> = row.try_get("action_id")?;
     let action_digest: Option<Vec<u8>> = row.try_get("action_digest")?;
     let reason: Option<String> = row.try_get("reason")?;
@@ -1899,7 +1879,8 @@ fn rebuild_evidence(row: &SqliteRow, verdict: Verdict) -> Result<Option<DclDecis
         EvidenceId::new(fixed_array(row.try_get("evidence_id")?)?),
     )
     .map_err(|_| StoreError::Corrupt)?;
-    let evidence = DclDecisionEvidence::certify(body, &signature).map_err(|_| StoreError::Corrupt)?;
+    let evidence =
+        DclDecisionEvidence::certify(body, &signature).map_err(|_| StoreError::Corrupt)?;
     Ok(Some(evidence))
 }
 
@@ -2113,11 +2094,9 @@ async fn migrate_inner(
         return Ok(true);
     }
 
-    sqlx::query(
-        "CREATE TABLE decision_migration_repair_ids (id INTEGER PRIMARY KEY)",
-    )
-    .execute(&mut *conn)
-    .await?;
+    sqlx::query("CREATE TABLE decision_migration_repair_ids (id INTEGER PRIMARY KEY)")
+        .execute(&mut *conn)
+        .await?;
     sqlx::query(
         "INSERT INTO decision_migration_repair_ids (id)
          SELECT p.id
@@ -2202,12 +2181,18 @@ async fn ensure_signing_claim_columns(conn: &mut SqliteConnection) -> Result<(),
 
 async fn ensure_decision_columns(conn: &mut SqliteConnection) -> Result<(), StoreError> {
     const COLUMNS: &[(&str, &str)] = &[
-        ("action_id", "ALTER TABLE decision_consumptions ADD COLUMN action_id TEXT"),
+        (
+            "action_id",
+            "ALTER TABLE decision_consumptions ADD COLUMN action_id TEXT",
+        ),
         (
             "action_digest",
             "ALTER TABLE decision_consumptions ADD COLUMN action_digest BLOB",
         ),
-        ("reason", "ALTER TABLE decision_consumptions ADD COLUMN reason TEXT"),
+        (
+            "reason",
+            "ALTER TABLE decision_consumptions ADD COLUMN reason TEXT",
+        ),
         (
             "oracle_signature",
             "ALTER TABLE decision_consumptions ADD COLUMN oracle_signature BLOB",
@@ -2465,11 +2450,7 @@ mod tests {
 
     fn temp_path() -> std::path::PathBuf {
         let n = NEXT.fetch_add(1, Ordering::SeqCst);
-        std::env::temp_dir().join(format!(
-            "dcl-fac-m2-{}-{}.db",
-            std::process::id(),
-            n
-        ))
+        std::env::temp_dir().join(format!("dcl-fac-m2-{}-{}.db", std::process::id(), n))
     }
 
     fn ctx(nonce: &str) -> PaymentContext {
@@ -2525,10 +2506,15 @@ mod tests {
         action: &ActionDigest,
         evidence_byte: u8,
         verdict: crate::evidence::Verdict,
-    ) -> (Decision, ConsumptionRecord, crate::evidence::DclDecisionEvidence, [u8; 65]) {
+    ) -> (
+        Decision,
+        ConsumptionRecord,
+        crate::evidence::DclDecisionEvidence,
+        [u8; 65],
+    ) {
         use crate::evidence::{
-            action_id_from_digest, AuthorizationIdentity, DecisionBody, DecisionReason,
-            DclDecisionEvidence, EvidenceId,
+            action_id_from_digest, AuthorizationIdentity, DclDecisionEvidence, DecisionBody,
+            DecisionReason, EvidenceId,
         };
         let hex = context.nonce().trim_start_matches("0x");
         let mut parsed = [0u8; 32];
@@ -2538,14 +2524,7 @@ mod tests {
             *byte = (high << 4) | low;
         }
         let authorization = AuthorizationIdentity::new(
-            8453,
-            [0x33; 20],
-            [0x11; 20],
-            [0x22; 20],
-            [0; 32],
-            [0; 32],
-            [1; 32],
-            parsed,
+            8453, [0x33; 20], [0x11; 20], [0x22; 20], [0; 32], [0; 32], [1; 32], parsed,
         );
         let body = DecisionBody::new(
             action_id_from_digest(action).unwrap(),
@@ -2573,9 +2552,9 @@ mod tests {
             crate::evidence::Verdict::Commit => {
                 Decision::Commit(Commit::for_oracle(context, action, "allowed"))
             }
-            crate::evidence::Verdict::NoCommit => {
-                Decision::NoCommit(crate::leibniz::NoCommit::for_oracle(context, action, "allowed"))
-            }
+            crate::evidence::Verdict::NoCommit => Decision::NoCommit(
+                crate::leibniz::NoCommit::for_oracle(context, action, "allowed"),
+            ),
         };
         (decision, record, evidence, payer_signature)
     }
@@ -2603,8 +2582,8 @@ mod tests {
         authorization_digest: [u8; 32],
     ) -> (ConsumptionRecord, crate::evidence::DclDecisionEvidence) {
         use crate::evidence::{
-            action_id_from_digest, AuthorizationIdentity, DecisionBody, DecisionReason,
-            DclDecisionEvidence, EvidenceId, Verdict,
+            action_id_from_digest, AuthorizationIdentity, DclDecisionEvidence, DecisionBody,
+            DecisionReason, EvidenceId, Verdict,
         };
         let authorization = AuthorizationIdentity::new(
             8453,
@@ -2827,7 +2806,10 @@ mod tests {
             .filter(|s| **s == PaymentState::Settling)
             .count();
         assert_eq!(settling, 1, "recovery must not start another settlement");
-        assert_eq!(states.last().copied(), Some(PaymentState::SettlementUnknown));
+        assert_eq!(
+            states.last().copied(),
+            Some(PaymentState::SettlementUnknown)
+        );
 
         let resolved = store
             .resolve_uncertain(&context, &action, PaymentState::Settled)
@@ -2881,15 +2863,15 @@ mod tests {
             .unwrap();
         let claim = store.claim_signing(&context).await.unwrap();
         store
-            .commit_signed(
-                &context,
-                &action,
-                &commit,
-                &signed,
-                &record,
-                &evidence,
-                &claim,
-            )
+            .commit_signed(SignedCommit {
+                context: &context,
+                action: &action,
+                commit: &commit,
+                signed: &signed,
+                record: &record,
+                evidence: &evidence,
+                claim: &claim,
+            })
             .await
             .unwrap();
         let observation = ReceiptObservation {
@@ -2920,12 +2902,7 @@ mod tests {
             .count();
         assert_eq!(settled, 1);
         let err = store
-            .conclude(
-                &context,
-                &action,
-                &observation,
-                PaymentState::SettleFailed,
-            )
+            .conclude(&context, &action, &observation, PaymentState::SettleFailed)
             .await
             .unwrap_err();
         assert!(matches!(
@@ -3219,13 +3196,7 @@ CREATE TABLE settlement_evidence (
             .await
             .unwrap();
         rows.iter()
-            .map(|row| {
-                (
-                    row.get("from_state"),
-                    row.get("to_state"),
-                    row.get("note"),
-                )
-            })
+            .map(|row| (row.get("from_state"), row.get("to_state"), row.get("note")))
             .collect()
     }
 
@@ -3262,12 +3233,11 @@ CREATE TABLE settlement_evidence (
             .unwrap()
             .get("state");
         assert_eq!(state, "rejected");
-        let flags = sqlx::query(
-            "SELECT legacy_incomplete, payer_signature FROM decision_consumptions",
-        )
-        .fetch_one(&store.inner.pool)
-        .await
-        .unwrap();
+        let flags =
+            sqlx::query("SELECT legacy_incomplete, payer_signature FROM decision_consumptions")
+                .fetch_one(&store.inner.pool)
+                .await
+                .unwrap();
         let incomplete: i64 = flags.get("legacy_incomplete");
         let signature: Option<Vec<u8>> = flags.get("payer_signature");
         assert_eq!(incomplete, 0);
@@ -3360,7 +3330,10 @@ CREATE TABLE settlement_evidence (
             .iter()
             .map(|row| row.get("state"))
             .collect();
-        assert_eq!(states, vec!["committed".to_string(), "verified".to_string()]);
+        assert_eq!(
+            states,
+            vec!["committed".to_string(), "verified".to_string()]
+        );
         assert_eq!(event_rows(&store.inner.pool).await.len(), 1);
         let decisions: i64 = sqlx::query("SELECT COUNT(*) AS n FROM decision_consumptions")
             .fetch_one(&store.inner.pool)
@@ -3595,12 +3568,12 @@ CREATE TABLE settlement_evidence (
             .await
             .unwrap();
         let other = Store::open(&path).await.unwrap();
-        let (left, right) = tokio::join!(
-            store.claim_signing(&context),
-            other.claim_signing(&context),
-        );
+        let (left, right) =
+            tokio::join!(store.claim_signing(&context), other.claim_signing(&context),);
         let claim = match (left, right) {
-            (Ok(claim), Err(StoreError::Conflict)) | (Err(StoreError::Conflict), Ok(claim)) => claim,
+            (Ok(claim), Err(StoreError::Conflict)) | (Err(StoreError::Conflict), Ok(claim)) => {
+                claim
+            }
             (Ok(_), Ok(_)) => panic!("two processes claimed the same commit"),
             _ => panic!("claim failed for an unclaimed commit"),
         };
@@ -3630,28 +3603,28 @@ CREATE TABLE settlement_evidence (
             raw_tx: vec![1, 2, 3],
         };
         let err = store
-            .commit_signed(
-                &context,
-                &action,
+            .commit_signed(SignedCommit {
+                context: &context,
+                action: &action,
                 commit,
-                &signed,
-                &record,
-                &evidence,
-                &released,
-            )
+                signed: &signed,
+                record: &record,
+                evidence: &evidence,
+                claim: &released,
+            })
             .await
             .unwrap_err();
         assert!(matches!(err, StoreError::Conflict));
         store
-            .commit_signed(
-                &context,
-                &action,
+            .commit_signed(SignedCommit {
+                context: &context,
+                action: &action,
                 commit,
-                &signed,
-                &record,
-                &evidence,
-                &renewed,
-            )
+                signed: &signed,
+                record: &record,
+                evidence: &evidence,
+                claim: &renewed,
+            })
             .await
             .unwrap();
         assert!(matches!(
@@ -3689,7 +3662,13 @@ CREATE TABLE settlement_evidence (
         let (refusal, refusal_record, refusal_evidence, _) =
             verified_commit(&context, &action, 0x12, crate::evidence::Verdict::NoCommit);
         let err = store
-            .refuse(&context, &action, &refusal, &refusal_record, &refusal_evidence)
+            .refuse(
+                &context,
+                &action,
+                &refusal,
+                &refusal_record,
+                &refusal_evidence,
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, StoreError::Conflict));
@@ -3757,14 +3736,13 @@ CREATE TABLE settlement_evidence (
                 .count(),
             1
         );
-        let raced: i64 = sqlx::query(
-            "SELECT COUNT(*) AS n FROM decision_consumptions WHERE nonce = ?",
-        )
-        .bind(payment_key_of(&other).unwrap().nonce())
-        .fetch_one(&store.inner.pool)
-        .await
-        .unwrap()
-        .get("n");
+        let raced: i64 =
+            sqlx::query("SELECT COUNT(*) AS n FROM decision_consumptions WHERE nonce = ?")
+                .bind(payment_key_of(&other).unwrap().nonce())
+                .fetch_one(&store.inner.pool)
+                .await
+                .unwrap()
+                .get("n");
         assert_eq!(raced, 1);
         assert_eq!(
             store
@@ -3791,7 +3769,13 @@ CREATE TABLE settlement_evidence (
         let (refusal, refusal_record, refusal_evidence, _) =
             verified_commit(&context, &action, 0x31, crate::evidence::Verdict::NoCommit);
         let rejected = store
-            .refuse(&context, &action, &refusal, &refusal_record, &refusal_evidence)
+            .refuse(
+                &context,
+                &action,
+                &refusal,
+                &refusal_record,
+                &refusal_evidence,
+            )
             .await
             .unwrap();
         assert_eq!(rejected.state(), PaymentState::Rejected);
@@ -3868,15 +3852,15 @@ CREATE TABLE settlement_evidence (
             raw_tx: vec![9, 9, 9],
         };
         let err = store
-            .commit_signed(
-                &context,
-                &action,
-                decision.as_commit().unwrap(),
-                &signed,
-                &record,
-                &evidence,
-                &SigningClaim { token: [9; 16] },
-            )
+            .commit_signed(SignedCommit {
+                context: &context,
+                action: &action,
+                commit: decision.as_commit().unwrap(),
+                signed: &signed,
+                record: &record,
+                evidence: &evidence,
+                claim: &SigningClaim { token: [9; 16] },
+            })
             .await
             .unwrap_err();
         assert!(matches!(err, StoreError::Conflict));
@@ -3961,19 +3945,23 @@ CREATE TABLE settlement_evidence (
         };
         let claim = store.claim_signing(&settled).await.unwrap();
         store
-            .commit_signed(
-                &settled,
-                &action_b,
+            .commit_signed(SignedCommit {
+                context: &settled,
+                action: &action_b,
                 commit,
-                &signed,
-                &commit_record,
-                &commit_evidence,
-                &claim,
-            )
+                signed: &signed,
+                record: &commit_record,
+                evidence: &commit_evidence,
+                claim: &claim,
+            })
             .await
             .unwrap();
-        let (later, later_record, later_evidence, _) =
-            verified_commit(&settled, &action_b, 0x62, crate::evidence::Verdict::NoCommit);
+        let (later, later_record, later_evidence, _) = verified_commit(
+            &settled,
+            &action_b,
+            0x62,
+            crate::evidence::Verdict::NoCommit,
+        );
         let err = store
             .refuse(&settled, &action_b, &later, &later_record, &later_evidence)
             .await
@@ -4018,8 +4006,12 @@ CREATE TABLE settlement_evidence (
         .fetch_one(&store.inner.pool)
         .await
         .unwrap();
-        let (other, other_record, other_evidence, other_signature) =
-            verified_commit(&incomplete, &action_c, 0x73, crate::evidence::Verdict::Commit);
+        let (other, other_record, other_evidence, other_signature) = verified_commit(
+            &incomplete,
+            &action_c,
+            0x73,
+            crate::evidence::Verdict::Commit,
+        );
         let err = store
             .persist_verified_commit(
                 &incomplete,
@@ -4032,8 +4024,12 @@ CREATE TABLE settlement_evidence (
             .await
             .unwrap_err();
         assert!(matches!(err, StoreError::Conflict));
-        let (refusal, refusal_record, refusal_evidence, _) =
-            verified_commit(&incomplete, &action_c, 0x74, crate::evidence::Verdict::NoCommit);
+        let (refusal, refusal_record, refusal_evidence, _) = verified_commit(
+            &incomplete,
+            &action_c,
+            0x74,
+            crate::evidence::Verdict::NoCommit,
+        );
         let err = store
             .refuse(
                 &incomplete,
@@ -4052,13 +4048,22 @@ CREATE TABLE settlement_evidence (
         .fetch_one(&store.inner.pool)
         .await
         .unwrap();
-        assert_eq!(after.get::<String, _>("verdict"), before.get::<String, _>("verdict"));
-        assert_eq!(after.get::<String, _>("state"), before.get::<String, _>("state"));
+        assert_eq!(
+            after.get::<String, _>("verdict"),
+            before.get::<String, _>("verdict")
+        );
+        assert_eq!(
+            after.get::<String, _>("state"),
+            before.get::<String, _>("state")
+        );
         assert_eq!(
             after.get::<i64, _>("legacy_incomplete"),
             before.get::<i64, _>("legacy_incomplete")
         );
-        assert!(after.try_get::<Option<Vec<u8>>, _>("payer_signature").unwrap().is_none());
+        assert!(after
+            .try_get::<Option<Vec<u8>>, _>("payer_signature")
+            .unwrap()
+            .is_none());
         assert_eq!(
             store
                 .get(incomplete.network(), incomplete.payer(), incomplete.nonce())

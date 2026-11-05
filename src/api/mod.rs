@@ -37,12 +37,7 @@ impl AppState {
     pub fn with_rpc(url: &str) -> Result<Self, std::io::Error> {
         BaseRpc::connect(url)
             .map(|rpc| Self::new(Some(rpc), None, None, None, None, Duration::from_secs(20)))
-            .map_err(|_| {
-                std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "failed to build the Base RPC client",
-                )
-            })
+            .map_err(|_| std::io::Error::other("failed to build the Base RPC client"))
     }
 
     pub fn new(

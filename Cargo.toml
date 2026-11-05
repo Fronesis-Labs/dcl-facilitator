@@ -3,15 +3,7 @@ name = "dcl-facilitator"
 version = "0.0.1"
 edition = "2021"
 publish = false
-description = "x402 facilitator with a DCL policy gate (Leibniz layer)"
-
-# Dependencies are added milestone by milestone, so that every version is
-# chosen and checked at the moment it is first needed:
-#   M3 settle : a transaction builder, still not added. Verify only recovers
-#               EIP-712 signatures and sends eth_call, so it uses k256, sha3,
-#               and reqwest rather than alloy.
-#   M2 store / state      : sqlx with the sqlite feature (added)
-#   M5 Leibniz gate       : sha2 (journal hash chain)
+description = "x402 v2 facilitator for Base mainnet USDC"
 
 [dependencies]
 axum = { version = "0.7", default-features = false, features = ["http1", "json", "tokio"] }

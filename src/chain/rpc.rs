@@ -6,8 +6,8 @@ use std::time::Duration;
 use serde_json::{json, Value};
 
 use super::eip3009::{
-    authorization_state_calldata, balance_of_calldata, to_checksum, transfer_with_authorization_calldata,
-    Authorization, ChainError, USDC_ADDRESS,
+    authorization_state_calldata, balance_of_calldata, to_checksum,
+    transfer_with_authorization_calldata, Authorization, ChainError, USDC_ADDRESS,
 };
 
 #[derive(Clone)]
@@ -167,11 +167,17 @@ impl BaseRpc {
             return Ok(None);
         }
         let receipt = value.as_object().ok_or(ChainError::Rpc)?;
-        let logs_value = receipt.get("logs").and_then(Value::as_array).ok_or(ChainError::Rpc)?;
+        let logs_value = receipt
+            .get("logs")
+            .and_then(Value::as_array)
+            .ok_or(ChainError::Rpc)?;
         let mut logs = Vec::with_capacity(logs_value.len());
         for log in logs_value {
             let log = log.as_object().ok_or(ChainError::Rpc)?;
-            let topics_value = log.get("topics").and_then(Value::as_array).ok_or(ChainError::Rpc)?;
+            let topics_value = log
+                .get("topics")
+                .and_then(Value::as_array)
+                .ok_or(ChainError::Rpc)?;
             let mut topics = Vec::with_capacity(topics_value.len());
             for topic in topics_value {
                 topics.push(parse_hash(topic.as_str().ok_or(ChainError::Rpc)?)?);
@@ -344,7 +350,7 @@ fn parse_address(value: &str) -> Result<[u8; 20], ChainError> {
 
 fn parse_bytes(value: &str) -> Result<Vec<u8>, ChainError> {
     let hex = strip_hex(value)?;
-    if hex.len() % 2 != 0 {
+    if !hex.len().is_multiple_of(2) {
         return Err(ChainError::Rpc);
     }
     hex_decode(hex).ok_or(ChainError::Rpc)
@@ -362,7 +368,7 @@ fn decode_uint256(result: &str) -> Result<[u8; 32], ChainError> {
         .strip_prefix("0x")
         .or_else(|| result.strip_prefix("0X"))
         .ok_or(ChainError::Rpc)?;
-    if hex.is_empty() || hex.len() > 64 || hex.len() % 2 != 0 {
+    if hex.is_empty() || hex.len() > 64 || !hex.len().is_multiple_of(2) {
         return Err(ChainError::Rpc);
     }
     let bytes = hex_decode(hex).ok_or(ChainError::Rpc)?;
@@ -376,7 +382,7 @@ fn decode_bool_word(result: &str) -> Result<bool, ChainError> {
         .strip_prefix("0x")
         .or_else(|| result.strip_prefix("0X"))
         .ok_or(ChainError::Rpc)?;
-    if hex.is_empty() || hex.len() > 64 || hex.len() % 2 != 0 {
+    if hex.is_empty() || hex.len() > 64 || !hex.len().is_multiple_of(2) {
         return Err(ChainError::Rpc);
     }
     let bytes = hex_decode(hex).ok_or(ChainError::Rpc)?;
@@ -432,14 +438,11 @@ mod tests {
     #[test]
     fn bool_word_is_strict() {
         let unused = format!("0x{}", "0".repeat(64));
-        assert_eq!(decode_bool_word(&unused).unwrap(), false);
+        assert!(!decode_bool_word(&unused).unwrap());
         let mut used = "0".repeat(63);
         used.push('1');
-        assert_eq!(decode_bool_word(&format!("0x{used}")).unwrap(), true);
-        assert!(matches!(
-            decode_bool_word("0x02"),
-            Err(ChainError::Rpc)
-        ));
+        assert!(decode_bool_word(&format!("0x{used}")).unwrap());
+        assert!(matches!(decode_bool_word("0x02"), Err(ChainError::Rpc)));
         assert!(decode_bool_word("0x").is_err());
     }
 }
