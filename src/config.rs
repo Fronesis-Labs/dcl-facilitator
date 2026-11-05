@@ -267,11 +267,24 @@ mod tests {
         assert_eq!(unpaired.unwrap_err(), ConfigError::SettlerKey);
 
         let zero = Config::from_lookup(|key| match key {
-            "SETTLER_KEY_FILE" => Some(r"C:\keys\relayer.hex".to_string()),
+            "SETTLER_KEY_FILE" => Some(absolute_key_outside_repo()),
             "SETTLER_MAX_FEE_PER_GAS" => Some("0".to_string()),
             _ => None,
         });
         assert_eq!(zero.unwrap_err(), ConfigError::MaxFee);
+    }
+
+    /// Absolute path that never exists in this repository. Zero-fee rejection
+    /// happens before the file is opened, so the path only has to be absolute.
+    fn absolute_key_outside_repo() -> String {
+        #[cfg(windows)]
+        {
+            r"C:\keys\relayer.hex".to_string()
+        }
+        #[cfg(unix)]
+        {
+            "/keys/relayer.hex".to_string()
+        }
     }
 
     #[test]
